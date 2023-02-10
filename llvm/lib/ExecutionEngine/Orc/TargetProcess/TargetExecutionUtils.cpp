@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ExecutionEngine/Orc/TargetProcess/TargetExecutionUtils.h"
+#include "llvm/ExecutionEngine/JITSymbol.h"
 
 #include <vector>
 
@@ -36,7 +37,16 @@ int runAsMain(int (*Main)(int, char *[]), ArrayRef<std::string> Args,
   }
   ArgV.push_back(nullptr);
 
-  return Main(Args.size() + !!ProgramName, ArgV.data());
+  int RawArgc = Args.size() + !!ProgramName;
+  char **RawArgv = ArgV.data();
+
+  printf("Calling int main(%d, 0x%08" PRIx64 ") @0x%08" PRIx64 "\n",
+         RawArgc, pointerToJITTargetAddress(RawArgv),
+         pointerToJITTargetAddress(Main));
+  int Result = Main(RawArgc, RawArgv);
+  printf("main @0x%08" PRIx64 " returned: %d\n", pointerToJITTargetAddress(Main), Result);
+
+  return Result;
 }
 
 int runAsVoidFunction(int (*Func)(void)) { return Func(); }
