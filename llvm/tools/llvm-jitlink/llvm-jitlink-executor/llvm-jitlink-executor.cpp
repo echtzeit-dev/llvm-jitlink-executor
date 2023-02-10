@@ -97,6 +97,8 @@ int openListener(std::string Host, std::string PortStr) {
     exit(1);
   }
 
+  printf("Listening at %s:%s\n", Host.c_str(), PortStr.c_str());
+
   // Listen for incomming connections.
   static constexpr int ConnectionQueueLen = 1;
   listen(SockFD, ConnectionQueueLen);
@@ -156,6 +158,8 @@ int main(int argc, char *argv[]) {
       printErrorAndExit("invalid specifier type \"" + SpecifierType + "\"");
   }
 
+  printf("Connected! Starting SimpleRemoteEPCServer.\n");
+
   auto Server =
       ExitOnErr(SimpleRemoteEPCServer::Create<FDSimpleRemoteEPCTransport>(
           [](SimpleRemoteEPCServer::Setup &S) -> Error {
@@ -163,6 +167,11 @@ int main(int argc, char *argv[]) {
                 std::make_unique<SimpleRemoteEPCServer::ThreadDispatcher>());
             S.bootstrapSymbols() =
                 SimpleRemoteEPCServer::defaultBootstrapSymbols();
+            printf("Bootstrap symbols:\n");
+            for (const auto &KV : S.bootstrapSymbols()) {
+              std::string Fn = KV.first().str();
+              printf("  %s: 0x%08" PRIx64 "\n", Fn.c_str(), KV.second.getValue());
+            }
             S.services().push_back(
                 std::make_unique<rt_bootstrap::SimpleExecutorMemoryManager>());
             S.services().push_back(
