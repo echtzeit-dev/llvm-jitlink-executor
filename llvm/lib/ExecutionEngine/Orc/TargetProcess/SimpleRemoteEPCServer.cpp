@@ -187,6 +187,7 @@ Error SimpleRemoteEPCServer::sendMessage(SimpleRemoteEPCOpcode OpC,
 }
 
 Error SimpleRemoteEPCServer::sendSetupMessage(
+    StringMap<std::vector<char>> BootstrapMap,
     StringMap<ExecutorAddr> BootstrapSymbols) {
 
   using namespace SimpleRemoteEPCDefaultBootstrapSymbolNames;
@@ -198,6 +199,7 @@ Error SimpleRemoteEPCServer::sendSetupMessage(
     EI.PageSize = *PageSize;
   else
     return PageSize.takeError();
+  EI.BootstrapMap = std::move(BootstrapMap);
   EI.BootstrapSymbols = std::move(BootstrapSymbols);
 
   assert(!EI.BootstrapSymbols.count(ExecutorSessionObjectName) &&
