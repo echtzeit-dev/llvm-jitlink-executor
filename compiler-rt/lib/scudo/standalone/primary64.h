@@ -9,6 +9,7 @@
 #ifndef SCUDO_PRIMARY64_H_
 #define SCUDO_PRIMARY64_H_
 
+#include "allocator_common.h"
 #include "bytemap.h"
 #include "common.h"
 #include "list.h"
@@ -48,16 +49,22 @@ public:
   typedef typename Config::Primary::CompactPtrT CompactPtrT;
   typedef typename Config::Primary::SizeClassMap SizeClassMap;
   static const uptr CompactPtrScale = Config::Primary::CompactPtrScale;
+  static const uptr RegionSizeLog = Config::Primary::RegionSizeLog;
   static const uptr GroupSizeLog = Config::Primary::GroupSizeLog;
+  static_assert(RegionSizeLog >= GroupSizeLog,
+                "Group size shouldn't be greater than the region size");
   static const uptr GroupScale = GroupSizeLog - CompactPtrScale;
   typedef SizeClassAllocator64<Config> ThisT;
   typedef SizeClassAllocatorLocalCache<ThisT> CacheT;
-  typedef typename CacheT::TransferBatch TransferBatch;
-  typedef typename CacheT::BatchGroup BatchGroup;
+  typedef TransferBatch<ThisT> TransferBatchT;
+  typedef BatchGroup<ThisT> BatchGroupT;
+
+  static_assert(sizeof(BatchGroupT) <= sizeof(TransferBatchT),
+                "BatchGroupT uses the same class size as TransferBatchT");
 
   static uptr getSizeByClassId(uptr ClassId) {
     return (ClassId == SizeClassMap::BatchClassId)
-               ? roundUp(sizeof(TransferBatch), 1U << CompactPtrScale)
+               ? roundUp(sizeof(TransferBatchT), 1U << CompactPtrScale)
                : SizeClassMap::getSizeByClassId(ClassId);
   }
 
@@ -67,7 +74,7 @@ public:
     DCHECK(isAligned(reinterpret_cast<uptr>(this), alignof(ThisT)));
 
     const uptr PageSize = getPageSizeCached();
-    const uptr GroupSize = (1U << GroupSizeLog);
+    const uptr GroupSize = (1UL << GroupSizeLog);
     const uptr PagesInGroup = GroupSize / PageSize;
     const uptr MinSizeClass = getSizeByClassId(1);
     // When trying to release pages back to memory, visiting smaller size
@@ -119,11 +126,10 @@ public:
       RegionInfo *Region = getRegionInfo(I);
       // The actual start of a region is offset by a random number of pages
       // when PrimaryEnableRandomOffset is set.
-      Region->RegionBeg =
-          (PrimaryBase + (I << Config::Primary::RegionSizeLog)) +
-          (Config::Primary::EnableRandomOffset
-               ? ((getRandomModN(&Seed, 16) + 1) * PageSize)
-               : 0);
+      Region->RegionBeg = (PrimaryBase + (I << RegionSizeLog)) +
+                          (Config::Primary::EnableRandomOffset
+                               ? ((getRandomModN(&Seed, 16) + 1) * PageSize)
+                               : 0);
       Region->RandState = getRandomU32(&Seed);
       // Releasing small blocks is expensive, set a higher threshold to avoid
       // frequent page releases.
@@ -134,7 +140,7 @@ public:
       Region->ReleaseInfo.LastReleaseAtNs = Time;
 
       Region->MemMapInfo.MemMap = ReservedMemory.dispatch(
-          PrimaryBase + (I << Config::Primary::RegionSizeLog), RegionSize);
+          PrimaryBase + (I << RegionSizeLog), RegionSize);
       CHECK(Region->MemMapInfo.MemMap.isAllocated());
     }
     shuffle(RegionInfoArray, NumClasses, &Seed);
@@ -165,7 +171,7 @@ public:
       ScopedLock FL(Region->FLLock);
       const uptr BlockSize = getSizeByClassId(I);
       uptr TotalBlocks = 0;
-      for (BatchGroup &BG : Region->FreeListInfo.BlockList) {
+      for (BatchGroupT &BG : Region->FreeListInfo.BlockList) {
         // `BG::Batches` are `TransferBatches`. +1 for `BatchGroup`.
         BatchClassUsedInFreeLists += BG.Batches.size() + 1;
         for (const auto &It : BG.Batches)
@@ -182,7 +188,7 @@ public:
     ScopedLock FL(Region->FLLock);
     const uptr BlockSize = getSizeByClassId(SizeClassMap::BatchClassId);
     uptr TotalBlocks = 0;
-    for (BatchGroup &BG : Region->FreeListInfo.BlockList) {
+    for (BatchGroupT &BG : Region->FreeListInfo.BlockList) {
       if (LIKELY(!BG.Batches.empty())) {
         for (const auto &It : BG.Batches)
           TotalBlocks += It.getCount();
@@ -201,19 +207,34 @@ public:
     DCHECK_EQ(BlocksInUse, BatchClassUsedInFreeLists);
   }
 
-  TransferBatch *popBatch(CacheT *C, uptr ClassId) {
+  u16 popBlocks(CacheT *C, uptr ClassId, CompactPtrT *ToArray) {
+    TransferBatchT *B = popBatch(C, ClassId);
+    if (!B)
+      return 0;
+
+    const u16 Count = B->getCount();
+    DCHECK_GT(Count, 0U);
+    B->moveToArray(ToArray);
+
+    if (ClassId != SizeClassMap::BatchClassId)
+      C->deallocate(SizeClassMap::BatchClassId, B);
+
+    return Count;
+  }
+
+  TransferBatchT *popBatch(CacheT *C, uptr ClassId) {
     DCHECK_LT(ClassId, NumClasses);
     RegionInfo *Region = getRegionInfo(ClassId);
 
     {
       ScopedLock L(Region->FLLock);
-      TransferBatch *B = popBatchImpl(C, ClassId, Region);
+      TransferBatchT *B = popBatchImpl(C, ClassId, Region);
       if (LIKELY(B))
         return B;
     }
 
-    bool PrintStats = false;
-    TransferBatch *B = nullptr;
+    bool ReportRegionExhausted = false;
+    TransferBatchT *B = nullptr;
 
     while (true) {
       // When two threads compete for `Region->MMLock`, we only want one of them
@@ -233,19 +254,13 @@ public:
       const bool RegionIsExhausted = Region->Exhausted;
       if (!RegionIsExhausted)
         B = populateFreeListAndPopBatch(C, ClassId, Region);
-      PrintStats = !RegionIsExhausted && Region->Exhausted;
+      ReportRegionExhausted = !RegionIsExhausted && Region->Exhausted;
       break;
     }
 
-    // Note that `getStats()` requires locking each region so we can't call it
-    // while locking the Region->Mutex in the above.
-    if (UNLIKELY(PrintStats)) {
-      ScopedString Str;
-      getStats(&Str);
-      Str.append(
-          "Scudo OOM: The process has exhausted %zuM for size class %zu.\n",
-          RegionSize >> 20, getSizeByClassId(ClassId));
-      Str.output();
+    if (UNLIKELY(ReportRegionExhausted)) {
+      Printf("Can't populate more pages for size class %zu.\n",
+             getSizeByClassId(ClassId));
 
       // Theoretically, BatchClass shouldn't be used up. Abort immediately  when
       // it happens.
@@ -271,19 +286,21 @@ public:
     // TODO(chiahungduan): Consider not doing grouping if the group size is not
     // greater than the block size with a certain scale.
 
-    // Sort the blocks so that blocks belonging to the same group can be pushed
-    // together.
     bool SameGroup = true;
-    for (u32 I = 1; I < Size; ++I) {
-      if (compactPtrGroup(Array[I - 1]) != compactPtrGroup(Array[I]))
-        SameGroup = false;
-      CompactPtrT Cur = Array[I];
-      u32 J = I;
-      while (J > 0 && compactPtrGroup(Cur) < compactPtrGroup(Array[J - 1])) {
-        Array[J] = Array[J - 1];
-        --J;
+    if (GroupSizeLog < RegionSizeLog) {
+      // Sort the blocks so that blocks belonging to the same group can be
+      // pushed together.
+      for (u32 I = 1; I < Size; ++I) {
+        if (compactPtrGroup(Array[I - 1]) != compactPtrGroup(Array[I]))
+          SameGroup = false;
+        CompactPtrT Cur = Array[I];
+        u32 J = I;
+        while (J > 0 && compactPtrGroup(Cur) < compactPtrGroup(Array[J - 1])) {
+          Array[J] = Array[J - 1];
+          --J;
+        }
+        Array[J] = Cur;
       }
-      Array[J] = Cur;
     }
 
     {
@@ -360,6 +377,18 @@ public:
       ScopedLock L1(Region->MMLock);
       ScopedLock L2(Region->FLLock);
       getStats(Str, I, Region);
+    }
+  }
+
+  void getFragmentationInfo(ScopedString *Str) {
+    Str->append(
+        "Fragmentation Stats: SizeClassAllocator64: page size = %zu bytes\n",
+        getPageSizeCached());
+
+    for (uptr I = 1; I < NumClasses; I++) {
+      RegionInfo *Region = getRegionInfo(I);
+      ScopedLock L(Region->MMLock);
+      getRegionFragmentationInfo(Region, I, Str);
     }
   }
 
@@ -477,7 +506,7 @@ public:
   AtomicOptions Options;
 
 private:
-  static const uptr RegionSize = 1UL << Config::Primary::RegionSizeLog;
+  static const uptr RegionSize = 1UL << RegionSizeLog;
   static const uptr NumClasses = SizeClassMap::NumClasses;
   static const uptr PrimarySize = RegionSize * NumClasses;
 
@@ -493,7 +522,7 @@ private:
   };
 
   struct BlocksInfo {
-    SinglyLinkedList<BatchGroup> BlockList = {};
+    SinglyLinkedList<BatchGroupT> BlockList = {};
     uptr PoppedBlocks = 0;
     uptr PushedBlocks = 0;
   };
@@ -605,11 +634,11 @@ private:
     // reusable and don't need additional space for them.
 
     Region->FreeListInfo.PushedBlocks += Size;
-    BatchGroup *BG = Region->FreeListInfo.BlockList.front();
+    BatchGroupT *BG = Region->FreeListInfo.BlockList.front();
 
     if (BG == nullptr) {
       // Construct `BatchGroup` on the last element.
-      BG = reinterpret_cast<BatchGroup *>(
+      BG = reinterpret_cast<BatchGroupT *>(
           decompactPtr(SizeClassMap::BatchClassId, Array[Size - 1]));
       --Size;
       BG->Batches.clear();
@@ -620,8 +649,8 @@ private:
       // from `CreateGroup` in `pushBlocksImpl`
       BG->PushedBlocks = 1;
       BG->BytesInBGAtLastCheckpoint = 0;
-      BG->MaxCachedPerBatch = TransferBatch::getMaxCached(
-          getSizeByClassId(SizeClassMap::BatchClassId));
+      BG->MaxCachedPerBatch =
+          CacheT::getMaxCached(getSizeByClassId(SizeClassMap::BatchClassId));
 
       Region->FreeListInfo.BlockList.push_front(BG);
     }
@@ -634,7 +663,7 @@ private:
     //   2. Only 1 block is pushed when the freelist is empty.
     if (BG->Batches.empty()) {
       // Construct the `TransferBatch` on the last element.
-      TransferBatch *TB = reinterpret_cast<TransferBatch *>(
+      TransferBatchT *TB = reinterpret_cast<TransferBatchT *>(
           decompactPtr(SizeClassMap::BatchClassId, Array[Size - 1]));
       TB->clear();
       // As mentioned above, addresses of `TransferBatch` and `BatchGroup` are
@@ -649,14 +678,14 @@ private:
       BG->Batches.push_front(TB);
     }
 
-    TransferBatch *CurBatch = BG->Batches.front();
+    TransferBatchT *CurBatch = BG->Batches.front();
     DCHECK_NE(CurBatch, nullptr);
 
     for (u32 I = 0; I < Size;) {
       u16 UnusedSlots =
           static_cast<u16>(BG->MaxCachedPerBatch - CurBatch->getCount());
       if (UnusedSlots == 0) {
-        CurBatch = reinterpret_cast<TransferBatch *>(
+        CurBatch = reinterpret_cast<TransferBatchT *>(
             decompactPtr(SizeClassMap::BatchClassId, Array[I]));
         CurBatch->clear();
         // Self-contained
@@ -699,24 +728,25 @@ private:
     DCHECK_GT(Size, 0U);
 
     auto CreateGroup = [&](uptr CompactPtrGroupBase) {
-      BatchGroup *BG = C->createGroup();
+      BatchGroupT *BG =
+          reinterpret_cast<BatchGroupT *>(C->getBatchClassBlock());
       BG->Batches.clear();
-      TransferBatch *TB = C->createBatch(ClassId, nullptr);
+      TransferBatchT *TB =
+          reinterpret_cast<TransferBatchT *>(C->getBatchClassBlock());
       TB->clear();
 
       BG->CompactPtrGroupBase = CompactPtrGroupBase;
       BG->Batches.push_front(TB);
       BG->PushedBlocks = 0;
       BG->BytesInBGAtLastCheckpoint = 0;
-      BG->MaxCachedPerBatch =
-          TransferBatch::getMaxCached(getSizeByClassId(ClassId));
+      BG->MaxCachedPerBatch = CacheT::getMaxCached(getSizeByClassId(ClassId));
 
       return BG;
     };
 
-    auto InsertBlocks = [&](BatchGroup *BG, CompactPtrT *Array, u32 Size) {
-      SinglyLinkedList<TransferBatch> &Batches = BG->Batches;
-      TransferBatch *CurBatch = Batches.front();
+    auto InsertBlocks = [&](BatchGroupT *BG, CompactPtrT *Array, u32 Size) {
+      SinglyLinkedList<TransferBatchT> &Batches = BG->Batches;
+      TransferBatchT *CurBatch = Batches.front();
       DCHECK_NE(CurBatch, nullptr);
 
       for (u32 I = 0; I < Size;) {
@@ -724,9 +754,8 @@ private:
         u16 UnusedSlots =
             static_cast<u16>(BG->MaxCachedPerBatch - CurBatch->getCount());
         if (UnusedSlots == 0) {
-          CurBatch = C->createBatch(
-              ClassId,
-              reinterpret_cast<void *>(decompactPtr(ClassId, Array[I])));
+          CurBatch =
+              reinterpret_cast<TransferBatchT *>(C->getBatchClassBlock());
           CurBatch->clear();
           Batches.push_front(CurBatch);
           UnusedSlots = BG->MaxCachedPerBatch;
@@ -741,21 +770,11 @@ private:
     };
 
     Region->FreeListInfo.PushedBlocks += Size;
-    BatchGroup *Cur = Region->FreeListInfo.BlockList.front();
-
-    if (ClassId == SizeClassMap::BatchClassId) {
-      if (Cur == nullptr) {
-        // Don't need to classify BatchClassId.
-        Cur = CreateGroup(/*CompactPtrGroupBase=*/0);
-        Region->FreeListInfo.BlockList.push_front(Cur);
-      }
-      InsertBlocks(Cur, Array, Size);
-      return;
-    }
+    BatchGroupT *Cur = Region->FreeListInfo.BlockList.front();
 
     // In the following, `Cur` always points to the BatchGroup for blocks that
     // will be pushed next. `Prev` is the element right before `Cur`.
-    BatchGroup *Prev = nullptr;
+    BatchGroupT *Prev = nullptr;
 
     while (Cur != nullptr &&
            compactPtrGroup(Array[0]) > Cur->CompactPtrGroupBase) {
@@ -816,22 +835,22 @@ private:
   // group id will be considered first.
   //
   // The region mutex needs to be held while calling this method.
-  TransferBatch *popBatchImpl(CacheT *C, uptr ClassId, RegionInfo *Region)
+  TransferBatchT *popBatchImpl(CacheT *C, uptr ClassId, RegionInfo *Region)
       REQUIRES(Region->FLLock) {
     if (Region->FreeListInfo.BlockList.empty())
       return nullptr;
 
-    SinglyLinkedList<TransferBatch> &Batches =
+    SinglyLinkedList<TransferBatchT> &Batches =
         Region->FreeListInfo.BlockList.front()->Batches;
 
     if (Batches.empty()) {
       DCHECK_EQ(ClassId, SizeClassMap::BatchClassId);
-      BatchGroup *BG = Region->FreeListInfo.BlockList.front();
+      BatchGroupT *BG = Region->FreeListInfo.BlockList.front();
       Region->FreeListInfo.BlockList.pop_front();
 
       // Block used by `BatchGroup` is from BatchClassId. Turn the block into
       // `TransferBatch` with single block.
-      TransferBatch *TB = reinterpret_cast<TransferBatch *>(BG);
+      TransferBatchT *TB = reinterpret_cast<TransferBatchT *>(BG);
       TB->clear();
       TB->add(
           compactPtr(SizeClassMap::BatchClassId, reinterpret_cast<uptr>(TB)));
@@ -839,13 +858,13 @@ private:
       return TB;
     }
 
-    TransferBatch *B = Batches.front();
+    TransferBatchT *B = Batches.front();
     Batches.pop_front();
     DCHECK_NE(B, nullptr);
     DCHECK_GT(B->getCount(), 0U);
 
     if (Batches.empty()) {
-      BatchGroup *BG = Region->FreeListInfo.BlockList.front();
+      BatchGroupT *BG = Region->FreeListInfo.BlockList.front();
       Region->FreeListInfo.BlockList.pop_front();
 
       // We don't keep BatchGroup with zero blocks to avoid empty-checking while
@@ -863,11 +882,11 @@ private:
   }
 
   // Refill the freelist and return one batch.
-  NOINLINE TransferBatch *populateFreeListAndPopBatch(CacheT *C, uptr ClassId,
-                                                      RegionInfo *Region)
+  NOINLINE TransferBatchT *populateFreeListAndPopBatch(CacheT *C, uptr ClassId,
+                                                       RegionInfo *Region)
       REQUIRES(Region->MMLock) EXCLUDES(Region->FLLock) {
     const uptr Size = getSizeByClassId(ClassId);
-    const u16 MaxCount = TransferBatch::getMaxCached(Size);
+    const u16 MaxCount = CacheT::getMaxCached(Size);
 
     const uptr RegionBeg = Region->RegionBeg;
     const uptr MappedUser = Region->MemMapInfo.MappedUser;
@@ -903,7 +922,7 @@ private:
     DCHECK_GT(NumberOfBlocks, 0);
 
     constexpr u32 ShuffleArraySize =
-        MaxNumBatches * TransferBatch::MaxNumCached;
+        MaxNumBatches * TransferBatchT::MaxNumCached;
     CompactPtrT ShuffleArray[ShuffleArraySize];
     DCHECK_LE(NumberOfBlocks, ShuffleArraySize);
 
@@ -936,7 +955,7 @@ private:
       pushBatchClassBlocks(Region, ShuffleArray, NumberOfBlocks);
     }
 
-    TransferBatch *B = popBatchImpl(C, ClassId, Region);
+    TransferBatchT *B = popBatchImpl(C, ClassId, Region);
     DCHECK_NE(B, nullptr);
 
     // Note that `PushedBlocks` and `PoppedBlocks` are supposed to only record
@@ -957,10 +976,10 @@ private:
     if (Region->MemMapInfo.MappedUser == 0)
       return;
     const uptr BlockSize = getSizeByClassId(ClassId);
-    const uptr InUse =
+    const uptr InUseBlocks =
         Region->FreeListInfo.PoppedBlocks - Region->FreeListInfo.PushedBlocks;
     const uptr BytesInFreeList =
-        Region->MemMapInfo.AllocatedUser - InUse * BlockSize;
+        Region->MemMapInfo.AllocatedUser - InUseBlocks * BlockSize;
     uptr RegionPushedBytesDelta = 0;
     if (BytesInFreeList >=
         Region->ReleaseInfo.BytesInFreeListAtLastCheckpoint) {
@@ -972,122 +991,141 @@ private:
         "%s %02zu (%6zu): mapped: %6zuK popped: %7zu pushed: %7zu "
         "inuse: %6zu total: %6zu releases: %6zu last "
         "released: %6zuK latest pushed bytes: %6zuK region: 0x%zx (0x%zx)\n",
-        Region->Exhausted ? "F" : " ", ClassId, getSizeByClassId(ClassId),
+        Region->Exhausted ? "E" : " ", ClassId, getSizeByClassId(ClassId),
         Region->MemMapInfo.MappedUser >> 10, Region->FreeListInfo.PoppedBlocks,
-        Region->FreeListInfo.PushedBlocks, InUse, TotalChunks,
+        Region->FreeListInfo.PushedBlocks, InUseBlocks, TotalChunks,
         Region->ReleaseInfo.RangesReleased,
         Region->ReleaseInfo.LastReleasedBytes >> 10,
         RegionPushedBytesDelta >> 10, Region->RegionBeg,
         getRegionBaseByClassId(ClassId));
   }
 
+  void getRegionFragmentationInfo(RegionInfo *Region, uptr ClassId,
+                                  ScopedString *Str) REQUIRES(Region->MMLock) {
+    const uptr BlockSize = getSizeByClassId(ClassId);
+    const uptr AllocatedUserEnd =
+        Region->MemMapInfo.AllocatedUser + Region->RegionBeg;
+
+    SinglyLinkedList<BatchGroupT> GroupsToRelease;
+    {
+      ScopedLock L(Region->FLLock);
+      GroupsToRelease = Region->FreeListInfo.BlockList;
+      Region->FreeListInfo.BlockList.clear();
+    }
+
+    FragmentationRecorder Recorder;
+    if (!GroupsToRelease.empty()) {
+      PageReleaseContext Context =
+          markFreeBlocks(Region, BlockSize, AllocatedUserEnd,
+                         getCompactPtrBaseByClassId(ClassId), GroupsToRelease);
+      auto SkipRegion = [](UNUSED uptr RegionIndex) { return false; };
+      releaseFreeMemoryToOS(Context, Recorder, SkipRegion);
+
+      mergeGroupsToReleaseBack(Region, GroupsToRelease);
+    }
+
+    ScopedLock L(Region->FLLock);
+    const uptr PageSize = getPageSizeCached();
+    const uptr TotalBlocks = Region->MemMapInfo.AllocatedUser / BlockSize;
+    const uptr InUseBlocks =
+        Region->FreeListInfo.PoppedBlocks - Region->FreeListInfo.PushedBlocks;
+    const uptr AllocatedPagesCount =
+        roundUp(Region->MemMapInfo.AllocatedUser, PageSize) / PageSize;
+    DCHECK_GE(AllocatedPagesCount, Recorder.getReleasedPagesCount());
+    const uptr InUsePages =
+        AllocatedPagesCount - Recorder.getReleasedPagesCount();
+    const uptr InUseBytes = InUsePages * PageSize;
+
+    Str->append("  %02zu (%6zu): inuse/total blocks: %6zu/%6zu inuse/total "
+                "pages: %6zu/%6zu inuse bytes: %6zuK\n",
+                ClassId, BlockSize, InUseBlocks, TotalBlocks, InUsePages,
+                AllocatedPagesCount, InUseBytes >> 10);
+  }
+
   NOINLINE uptr releaseToOSMaybe(RegionInfo *Region, uptr ClassId,
                                  ReleaseToOS ReleaseType = ReleaseToOS::Normal)
       REQUIRES(Region->MMLock) EXCLUDES(Region->FLLock) {
-    ScopedLock L(Region->FLLock);
-
     const uptr BlockSize = getSizeByClassId(ClassId);
-    const uptr BytesInFreeList =
-        Region->MemMapInfo.AllocatedUser - (Region->FreeListInfo.PoppedBlocks -
-                                            Region->FreeListInfo.PushedBlocks) *
-                                               BlockSize;
-    if (UNLIKELY(BytesInFreeList == 0))
-      return false;
-
+    uptr BytesInFreeList;
     const uptr AllocatedUserEnd =
         Region->MemMapInfo.AllocatedUser + Region->RegionBeg;
-    const uptr CompactPtrBase = getCompactPtrBaseByClassId(ClassId);
+    SinglyLinkedList<BatchGroupT> GroupsToRelease;
 
-    // ====================================================================== //
-    // 1. Check if we have enough free blocks and if it's worth doing a page
-    //    release.
-    // ====================================================================== //
-    if (ReleaseType != ReleaseToOS::ForceAll &&
-        !hasChanceToReleasePages(Region, BlockSize, BytesInFreeList,
-                                 ReleaseType)) {
-      return 0;
-    }
+    {
+      ScopedLock L(Region->FLLock);
 
-    // ====================================================================== //
-    // 2. Determine which groups can release the pages. Use a heuristic to
-    //    gather groups that are candidates for doing a release.
-    // ====================================================================== //
-    SinglyLinkedList<BatchGroup> GroupsToRelease;
-    if (ReleaseType == ReleaseToOS::ForceAll) {
-      GroupsToRelease = Region->FreeListInfo.BlockList;
-      Region->FreeListInfo.BlockList.clear();
-    } else {
-      GroupsToRelease = collectGroupsToRelease(
-          Region, BlockSize, AllocatedUserEnd, CompactPtrBase);
-    }
-    if (GroupsToRelease.empty())
-      return 0;
+      BytesInFreeList = Region->MemMapInfo.AllocatedUser -
+                        (Region->FreeListInfo.PoppedBlocks -
+                         Region->FreeListInfo.PushedBlocks) *
+                            BlockSize;
+      if (UNLIKELY(BytesInFreeList == 0))
+        return false;
 
-    // Ideally, we should use a class like `ScopedUnlock`. However, this form of
-    // unlocking is not supported by the thread-safety analysis. See
-    // https://clang.llvm.org/docs/ThreadSafetyAnalysis.html#no-alias-analysis
-    // for more details.
-    // Put it as local class so that we can mark the ctor/dtor with proper
-    // annotations associated to the target lock. Note that accessing the
-    // function variable in local class only works in thread-safety annotations.
-    // TODO: Implement general `ScopedUnlock` when it's supported.
-    class FLLockScopedUnlock {
-    public:
-      FLLockScopedUnlock(RegionInfo *Region) RELEASE(Region->FLLock)
-          : R(Region) {
-        R->FLLock.assertHeld();
-        R->FLLock.unlock();
+      // ==================================================================== //
+      // 1. Check if we have enough free blocks and if it's worth doing a page
+      //    release.
+      // ==================================================================== //
+      if (ReleaseType != ReleaseToOS::ForceAll &&
+          !hasChanceToReleasePages(Region, BlockSize, BytesInFreeList,
+                                   ReleaseType)) {
+        return 0;
       }
-      ~FLLockScopedUnlock() ACQUIRE(Region->FLLock) { R->FLLock.lock(); }
 
-    private:
-      RegionInfo *R;
-    };
+      // ==================================================================== //
+      // 2. Determine which groups can release the pages. Use a heuristic to
+      //    gather groups that are candidates for doing a release.
+      // ==================================================================== //
+      if (ReleaseType == ReleaseToOS::ForceAll) {
+        GroupsToRelease = Region->FreeListInfo.BlockList;
+        Region->FreeListInfo.BlockList.clear();
+      } else {
+        GroupsToRelease =
+            collectGroupsToRelease(Region, BlockSize, AllocatedUserEnd,
+                                   getCompactPtrBaseByClassId(ClassId));
+      }
+      if (GroupsToRelease.empty())
+        return 0;
+    }
 
     // Note that we have extracted the `GroupsToRelease` from region freelist.
     // It's safe to let pushBlocks()/popBatches() access the remaining region
     // freelist. In the steps 3 and 4, we will temporarily release the FLLock
     // and lock it again before step 5.
 
-    uptr ReleasedBytes = 0;
-    {
-      FLLockScopedUnlock UL(Region);
-      // ==================================================================== //
-      // 3. Mark the free blocks in `GroupsToRelease` in the
-      //    `PageReleaseContext`. Then we can tell which pages are in-use by
-      //    querying `PageReleaseContext`.
-      // ==================================================================== //
-      PageReleaseContext Context = markFreeBlocks(
-          Region, BlockSize, AllocatedUserEnd, CompactPtrBase, GroupsToRelease);
-      if (UNLIKELY(!Context.hasBlockMarked())) {
-        ScopedLock L(Region->FLLock);
-        mergeGroupsToReleaseBack(Region, GroupsToRelease);
-        return 0;
-      }
-
-      // ==================================================================== //
-      // 4. Release the unused physical pages back to the OS.
-      // ==================================================================== //
-      RegionReleaseRecorder<MemMapT> Recorder(&Region->MemMapInfo.MemMap,
-                                              Region->RegionBeg,
-                                              Context.getReleaseOffset());
-      auto SkipRegion = [](UNUSED uptr RegionIndex) { return false; };
-      releaseFreeMemoryToOS(Context, Recorder, SkipRegion);
-      if (Recorder.getReleasedRangesCount() > 0) {
-        Region->ReleaseInfo.BytesInFreeListAtLastCheckpoint = BytesInFreeList;
-        Region->ReleaseInfo.RangesReleased += Recorder.getReleasedRangesCount();
-        Region->ReleaseInfo.LastReleasedBytes = Recorder.getReleasedBytes();
-      }
-      Region->ReleaseInfo.LastReleaseAtNs = getMonotonicTimeFast();
-      ReleasedBytes = Recorder.getReleasedBytes();
+    // ==================================================================== //
+    // 3. Mark the free blocks in `GroupsToRelease` in the `PageReleaseContext`.
+    //    Then we can tell which pages are in-use by querying
+    //    `PageReleaseContext`.
+    // ==================================================================== //
+    PageReleaseContext Context =
+        markFreeBlocks(Region, BlockSize, AllocatedUserEnd,
+                       getCompactPtrBaseByClassId(ClassId), GroupsToRelease);
+    if (UNLIKELY(!Context.hasBlockMarked())) {
+      mergeGroupsToReleaseBack(Region, GroupsToRelease);
+      return 0;
     }
+
+    // ==================================================================== //
+    // 4. Release the unused physical pages back to the OS.
+    // ==================================================================== //
+    RegionReleaseRecorder<MemMapT> Recorder(&Region->MemMapInfo.MemMap,
+                                            Region->RegionBeg,
+                                            Context.getReleaseOffset());
+    auto SkipRegion = [](UNUSED uptr RegionIndex) { return false; };
+    releaseFreeMemoryToOS(Context, Recorder, SkipRegion);
+    if (Recorder.getReleasedRangesCount() > 0) {
+      Region->ReleaseInfo.BytesInFreeListAtLastCheckpoint = BytesInFreeList;
+      Region->ReleaseInfo.RangesReleased += Recorder.getReleasedRangesCount();
+      Region->ReleaseInfo.LastReleasedBytes = Recorder.getReleasedBytes();
+    }
+    Region->ReleaseInfo.LastReleaseAtNs = getMonotonicTimeFast();
 
     // ====================================================================== //
     // 5. Merge the `GroupsToRelease` back to the freelist.
     // ====================================================================== //
     mergeGroupsToReleaseBack(Region, GroupsToRelease);
 
-    return ReleasedBytes;
+    return Recorder.getReleasedBytes();
   }
 
   bool hasChanceToReleasePages(RegionInfo *Region, uptr BlockSize,
@@ -1154,13 +1192,13 @@ private:
     return true;
   }
 
-  SinglyLinkedList<BatchGroup>
+  SinglyLinkedList<BatchGroupT>
   collectGroupsToRelease(RegionInfo *Region, const uptr BlockSize,
                          const uptr AllocatedUserEnd, const uptr CompactPtrBase)
       REQUIRES(Region->MMLock, Region->FLLock) {
-    const uptr GroupSize = (1U << GroupSizeLog);
+    const uptr GroupSize = (1UL << GroupSizeLog);
     const uptr PageSize = getPageSizeCached();
-    SinglyLinkedList<BatchGroup> GroupsToRelease;
+    SinglyLinkedList<BatchGroupT> GroupsToRelease;
 
     // We are examining each group and will take the minimum distance to the
     // release threshold as the next Region::TryReleaseThreshold(). Note that if
@@ -1169,8 +1207,8 @@ private:
     // the comment on `SmallerBlockReleasePageDelta` for more details.
     uptr MinDistToThreshold = GroupSize;
 
-    for (BatchGroup *BG = Region->FreeListInfo.BlockList.front(),
-                    *Prev = nullptr;
+    for (BatchGroupT *BG = Region->FreeListInfo.BlockList.front(),
+                     *Prev = nullptr;
          BG != nullptr;) {
       // Group boundary is always GroupSize-aligned from CompactPtr base. The
       // layout of memory groups is like,
@@ -1254,7 +1292,7 @@ private:
         }
       }
 
-      // If `BG` is the first BatchGroup in the list, we only need to advance
+      // If `BG` is the first BatchGroupT in the list, we only need to advance
       // `BG` and call FreeListInfo.BlockList::pop_front(). No update is needed
       // for `Prev`.
       //
@@ -1290,7 +1328,7 @@ private:
       // Note that we need to advance before pushing this BatchGroup to
       // GroupsToRelease because it's a destructive operation.
 
-      BatchGroup *Cur = BG;
+      BatchGroupT *Cur = BG;
       BG = BG->Next;
 
       // Ideally, we may want to update this only after successful release.
@@ -1323,9 +1361,9 @@ private:
   PageReleaseContext
   markFreeBlocks(RegionInfo *Region, const uptr BlockSize,
                  const uptr AllocatedUserEnd, const uptr CompactPtrBase,
-                 SinglyLinkedList<BatchGroup> &GroupsToRelease)
+                 SinglyLinkedList<BatchGroupT> &GroupsToRelease)
       REQUIRES(Region->MMLock) EXCLUDES(Region->FLLock) {
-    const uptr GroupSize = (1U << GroupSizeLog);
+    const uptr GroupSize = (1UL << GroupSizeLog);
     auto DecompactPtr = [CompactPtrBase](CompactPtrT CompactPtr) {
       return decompactPtrInternal(CompactPtrBase, CompactPtr);
     };
@@ -1352,7 +1390,7 @@ private:
     if (UNLIKELY(!Context.ensurePageMapAllocated()))
       return Context;
 
-    for (BatchGroup &BG : GroupsToRelease) {
+    for (BatchGroupT &BG : GroupsToRelease) {
       const uptr BatchGroupBase =
           decompactGroupBase(CompactPtrBase, BG.CompactPtrGroupBase);
       const uptr BatchGroupEnd = BatchGroupBase + GroupSize;
@@ -1400,8 +1438,10 @@ private:
   }
 
   void mergeGroupsToReleaseBack(RegionInfo *Region,
-                                SinglyLinkedList<BatchGroup> &GroupsToRelease)
-      REQUIRES(Region->MMLock, Region->FLLock) {
+                                SinglyLinkedList<BatchGroupT> &GroupsToRelease)
+      REQUIRES(Region->MMLock) EXCLUDES(Region->FLLock) {
+    ScopedLock L(Region->FLLock);
+
     // After merging two freelists, we may have redundant `BatchGroup`s that
     // need to be recycled. The number of unused `BatchGroup`s is expected to be
     // small. Pick a constant which is inferred from real programs.
@@ -1419,8 +1459,8 @@ private:
     // Merge GroupsToRelease back to the Region::FreeListInfo.BlockList. Note
     // that both `Region->FreeListInfo.BlockList` and `GroupsToRelease` are
     // sorted.
-    for (BatchGroup *BG = Region->FreeListInfo.BlockList.front(),
-                    *Prev = nullptr;
+    for (BatchGroupT *BG = Region->FreeListInfo.BlockList.front(),
+                     *Prev = nullptr;
          ;) {
       if (BG == nullptr || GroupsToRelease.empty()) {
         if (!GroupsToRelease.empty())
@@ -1437,8 +1477,8 @@ private:
         continue;
       }
 
-      BatchGroup *Cur = GroupsToRelease.front();
-      TransferBatch *UnusedTransferBatch = nullptr;
+      BatchGroupT *Cur = GroupsToRelease.front();
+      TransferBatchT *UnusedTransferBatch = nullptr;
       GroupsToRelease.pop_front();
 
       if (BG->CompactPtrGroupBase == Cur->CompactPtrGroupBase) {
@@ -1454,7 +1494,7 @@ private:
         if (Cur->Batches.front()->getCount() == MaxCachedPerBatch) {
           BG->Batches.append_back(&Cur->Batches);
         } else {
-          TransferBatch *NonFullBatch = Cur->Batches.front();
+          TransferBatchT *NonFullBatch = Cur->Batches.front();
           Cur->Batches.pop_front();
           const u16 NonFullBatchCount = NonFullBatch->getCount();
           // The remaining Batches in `Cur` are full.
@@ -1519,8 +1559,8 @@ private:
     }
 
     if (SCUDO_DEBUG) {
-      BatchGroup *Prev = Region->FreeListInfo.BlockList.front();
-      for (BatchGroup *Cur = Prev->Next; Cur != nullptr;
+      BatchGroupT *Prev = Region->FreeListInfo.BlockList.front();
+      for (BatchGroupT *Cur = Prev->Next; Cur != nullptr;
            Prev = Cur, Cur = Cur->Next) {
         CHECK_LT(Prev->CompactPtrGroupBase, Cur->CompactPtrGroupBase);
       }

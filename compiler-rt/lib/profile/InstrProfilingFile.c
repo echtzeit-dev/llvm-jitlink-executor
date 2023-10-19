@@ -426,7 +426,12 @@ static void createProfileDir(const char *Filename) {
 static FILE *openFileForMerging(const char *ProfileFileName, int *MergeDone) {
   FILE *ProfileFile = getProfileFile();
   int rc;
-
+  // initializeProfileForContinuousMode will lock the profile, but if
+  // ProfileFile is set by user via __llvm_profile_set_file_object, it's assumed
+  // unlocked at this point.
+  if (ProfileFile && !__llvm_profile_is_continuous_mode_enabled()) {
+    lprofLockFileHandle(ProfileFile);
+  }
   if (!ProfileFile) {
     createProfileDir(ProfileFileName);
     ProfileFile = lprofOpenFileEx(ProfileFileName);
@@ -478,6 +483,9 @@ static int writeFile(const char *OutputName) {
 
   if (OutputFile == getProfileFile()) {
     fflush(OutputFile);
+    if (doMerging() && !__llvm_profile_is_continuous_mode_enabled()) {
+      lprofUnlockFileHandle(OutputFile);
+    }
   } else {
     fclose(OutputFile);
   }
@@ -1026,10 +1034,14 @@ int __llvm_profile_write_file(void) {
   int rc, Length;
   const char *Filename;
   char *FilenameBuf;
-  int PDeathSig = 0;
+
+  // Temporarily suspend getting SIGKILL when the parent exits.
+  int PDeathSig = lprofSuspendSigKill();
 
   if (lprofProfileDumped() || __llvm_profile_is_continuous_mode_enabled()) {
     PROF_NOTE("Profile data not written to file: %s.\n", "already written");
+    if (PDeathSig == 1)
+      lprofRestoreSigKill();
     return 0;
   }
 
@@ -1040,6 +1052,8 @@ int __llvm_profile_write_file(void) {
   /* Check the filename. */
   if (!Filename) {
     PROF_ERR("Failed to write file : %s\n", "Filename not set");
+    if (PDeathSig == 1)
+      lprofRestoreSigKill();
     return -1;
   }
 
@@ -1049,11 +1063,10 @@ int __llvm_profile_write_file(void) {
              "expected %d, but get %d\n",
              INSTR_PROF_RAW_VERSION,
              (int)GET_VERSION(__llvm_profile_get_version()));
+    if (PDeathSig == 1)
+      lprofRestoreSigKill();
     return -1;
   }
-
-  // Temporarily suspend getting SIGKILL when the parent exits.
-  PDeathSig = lprofSuspendSigKill();
 
   /* Write profile data to the file. */
   rc = writeFile(Filename);
@@ -1087,7 +1100,9 @@ int __llvm_orderfile_write_file(void) {
   int rc, Length, LengthBeforeAppend, SuffixLength;
   const char *Filename;
   char *FilenameBuf;
-  int PDeathSig = 0;
+
+  // Temporarily suspend getting SIGKILL when the parent exits.
+  int PDeathSig = lprofSuspendSigKill();
 
   SuffixLength = strlen(OrderFileSuffix);
   Length = getCurFilenameLength() + SuffixLength;
@@ -1097,6 +1112,8 @@ int __llvm_orderfile_write_file(void) {
   /* Check the filename. */
   if (!Filename) {
     PROF_ERR("Failed to write file : %s\n", "Filename not set");
+    if (PDeathSig == 1)
+      lprofRestoreSigKill();
     return -1;
   }
 
@@ -1111,11 +1128,10 @@ int __llvm_orderfile_write_file(void) {
              "expected %d, but get %d\n",
              INSTR_PROF_RAW_VERSION,
              (int)GET_VERSION(__llvm_profile_get_version()));
+    if (PDeathSig == 1)
+      lprofRestoreSigKill();
     return -1;
   }
-
-  // Temporarily suspend getting SIGKILL when the parent exits.
-  PDeathSig = lprofSuspendSigKill();
 
   /* Write order data to the file. */
   rc = writeOrderFile(Filename);
