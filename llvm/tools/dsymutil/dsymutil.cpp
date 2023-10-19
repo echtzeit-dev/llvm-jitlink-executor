@@ -241,6 +241,24 @@ getAccelTableKind(opt::InputArgList &Args) {
   return DsymutilAccelTableKind::Default;
 }
 
+static Expected<DsymutilDWARFLinkerType>
+getDWARFLinkerType(opt::InputArgList &Args) {
+  if (opt::Arg *LinkerType = Args.getLastArg(OPT_linker)) {
+    StringRef S = LinkerType->getValue();
+    if (S == "apple")
+      return DsymutilDWARFLinkerType::Apple;
+    if (S == "llvm")
+      return DsymutilDWARFLinkerType::LLVM;
+    return make_error<StringError>("invalid DWARF linker type specified: '" +
+                                       S +
+                                       "'. Supported values are 'apple', "
+                                       "'llvm'.",
+                                   inconvertibleErrorCode());
+  }
+
+  return DsymutilDWARFLinkerType::Apple;
+}
+
 static Expected<ReproducerMode> getReproducerMode(opt::InputArgList &Args) {
   if (Args.hasArg(OPT_gen_reproducer))
     return ReproducerMode::GenerateOnExit;
@@ -250,14 +268,12 @@ static Expected<ReproducerMode> getReproducerMode(opt::InputArgList &Args) {
       return ReproducerMode::GenerateOnExit;
     if (S == "GenerateOnCrash")
       return ReproducerMode::GenerateOnCrash;
-    if (S == "Use")
-      return ReproducerMode::Use;
     if (S == "Off")
       return ReproducerMode::Off;
     return make_error<StringError>(
         "invalid reproducer mode: '" + S +
             "'. Supported values are 'GenerateOnExit', 'GenerateOnCrash', "
-            "'Use', 'Off'.",
+            "'Off'.",
         inconvertibleErrorCode());
   }
   return ReproducerMode::GenerateOnCrash;
@@ -332,6 +348,13 @@ static Expected<DsymutilOptions> getOptions(opt::InputArgList &Args) {
     return AccelKind.takeError();
   }
 
+  if (Expected<DsymutilDWARFLinkerType> DWARFLinkerType =
+          getDWARFLinkerType(Args)) {
+    Options.LinkOpts.DWARFLinkerType = *DWARFLinkerType;
+  } else {
+    return DWARFLinkerType.takeError();
+  }
+
   if (opt::Arg *SymbolMap = Args.getLastArg(OPT_symbolmap))
     Options.SymbolMap = SymbolMap->getValue();
 
@@ -364,7 +387,7 @@ static Expected<DsymutilOptions> getOptions(opt::InputArgList &Args) {
     Options.Toolchain = Toolchain->getValue();
 
   if (Args.hasArg(OPT_assembly))
-    Options.LinkOpts.FileType = OutputFileType::Assembly;
+    Options.LinkOpts.FileType = DWARFLinker::OutputFileType::Assembly;
 
   if (opt::Arg *NumThreads = Args.getLastArg(OPT_threads))
     Options.LinkOpts.Threads = atoi(NumThreads->getValue());
@@ -388,6 +411,9 @@ static Expected<DsymutilOptions> getOptions(opt::InputArgList &Args) {
     else
       return FormatOrErr.takeError();
   }
+
+  Options.LinkOpts.RemarksKeepAll =
+      !Args.hasArg(OPT_remarks_drop_without_debug);
 
   if (Error E = verifyOptions(Options))
     return std::move(E);
@@ -613,7 +639,7 @@ int main(int argc, char **argv) {
 
   auto OptionsOrErr = getOptions(Args);
   if (!OptionsOrErr) {
-    WithColor::error() << toString(OptionsOrErr.takeError());
+    WithColor::error() << toString(OptionsOrErr.takeError()) << '\n';
     return EXIT_FAILURE;
   }
 
@@ -627,7 +653,7 @@ int main(int argc, char **argv) {
   auto Repro = Reproducer::createReproducer(Options.ReproMode,
                                             Options.ReproducerPath, argc, argv);
   if (!Repro) {
-    WithColor::error() << toString(Repro.takeError());
+    WithColor::error() << toString(Repro.takeError()) << '\n';
     return EXIT_FAILURE;
   }
 
@@ -719,6 +745,8 @@ int main(int argc, char **argv) {
     std::atomic_char AllOK(1);
     SmallVector<MachOUtils::ArchAndFile, 4> TempFiles;
 
+    std::mutex ErrorHandlerMutex;
+
     const bool Crashed = !CRC.RunSafely([&]() {
       for (auto &Map : *DebugMapPtrsOrErr) {
         if (Options.LinkOpts.Verbose || Options.DumpDebugMap)
@@ -769,7 +797,8 @@ int main(int argc, char **argv) {
 
         auto LinkLambda = [&,
                            OutputFile](std::shared_ptr<raw_fd_ostream> Stream) {
-          DwarfLinkerForBinary Linker(*Stream, BinHolder, Options.LinkOpts);
+          DwarfLinkerForBinary Linker(*Stream, BinHolder, Options.LinkOpts,
+                                      ErrorHandlerMutex);
           AllOK.fetch_and(Linker.link(*Map));
           Stream->flush();
           if (flagIsSet(Options.Verify, DWARFVerify::Output) ||

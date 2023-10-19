@@ -53,10 +53,6 @@ void llvm::initializeCore(PassRegistry &Registry) {
   initializeVerifierLegacyPassPass(Registry);
 }
 
-void LLVMInitializeCore(LLVMPassRegistryRef R) {
-  initializeCore(*unwrap(R));
-}
-
 void LLVMShutdown() {
   llvm_shutdown();
 }
@@ -797,7 +793,7 @@ LLVMTypeRef LLVMPointerType(LLVMTypeRef ElementType, unsigned AddressSpace) {
 }
 
 LLVMBool LLVMPointerTypeIsOpaque(LLVMTypeRef Ty) {
-  return unwrap(Ty)->isOpaquePointerTy();
+  return true;
 }
 
 LLVMTypeRef LLVMVectorType(LLVMTypeRef ElementType, unsigned ElementCount) {
@@ -3448,6 +3444,36 @@ LLVMValueRef LLVMBuildNot(LLVMBuilderRef B, LLVMValueRef V, const char *Name) {
   return wrap(unwrap(B)->CreateNot(unwrap(V), Name));
 }
 
+LLVMBool LLVMGetNUW(LLVMValueRef ArithInst) {
+  Value *P = unwrap<Value>(ArithInst);
+  return cast<Instruction>(P)->hasNoUnsignedWrap();
+}
+
+void LLVMSetNUW(LLVMValueRef ArithInst, LLVMBool HasNUW) {
+  Value *P = unwrap<Value>(ArithInst);
+  cast<Instruction>(P)->setHasNoUnsignedWrap(HasNUW);
+}
+
+LLVMBool LLVMGetNSW(LLVMValueRef ArithInst) {
+  Value *P = unwrap<Value>(ArithInst);
+  return cast<Instruction>(P)->hasNoSignedWrap();
+}
+
+void LLVMSetNSW(LLVMValueRef ArithInst, LLVMBool HasNSW) {
+  Value *P = unwrap<Value>(ArithInst);
+  cast<Instruction>(P)->setHasNoSignedWrap(HasNSW);
+}
+
+LLVMBool LLVMGetExact(LLVMValueRef DivOrShrInst) {
+  Value *P = unwrap<Value>(DivOrShrInst);
+  return cast<Instruction>(P)->isExact();
+}
+
+void LLVMSetExact(LLVMValueRef DivOrShrInst, LLVMBool IsExact) {
+  Value *P = unwrap<Value>(DivOrShrInst);
+  cast<Instruction>(P)->setIsExact(IsExact);
+}
+
 /*--.. Memory ..............................................................--*/
 
 LLVMValueRef LLVMBuildMalloc(LLVMBuilderRef B, LLVMTypeRef Ty,
@@ -3953,7 +3979,7 @@ int LLVMGetMaskValue(LLVMValueRef SVInst, unsigned Elt) {
   return I->getMaskValue(Elt);
 }
 
-int LLVMGetUndefMaskElem(void) { return UndefMaskElem; }
+int LLVMGetUndefMaskElem(void) { return PoisonMaskElem; }
 
 LLVMBool LLVMIsAtomicSingleThread(LLVMValueRef AtomicInst) {
   Value *P = unwrap(AtomicInst);
@@ -4069,12 +4095,6 @@ size_t LLVMGetBufferSize(LLVMMemoryBufferRef MemBuf) {
 
 void LLVMDisposeMemoryBuffer(LLVMMemoryBufferRef MemBuf) {
   delete unwrap(MemBuf);
-}
-
-/*===-- Pass Registry -----------------------------------------------------===*/
-
-LLVMPassRegistryRef LLVMGetGlobalPassRegistry(void) {
-  return wrap(PassRegistry::getPassRegistry());
 }
 
 /*===-- Pass Manager ------------------------------------------------------===*/

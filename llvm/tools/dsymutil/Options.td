@@ -169,7 +169,7 @@ def: Separate<["-"], "j">,
 
 def reproducer: Separate<["--", "-"], "reproducer">,
   MetaVarName<"<mode>">,
-  HelpText<"Specify the reproducer generation mode. Valid options are 'GenerateOnExit', 'GenerateOnCrash', 'Use', 'Off'.">,
+  HelpText<"Specify the reproducer generation mode. Valid options are 'GenerateOnExit', 'GenerateOnCrash', 'Off'.">,
   Group<grp_general>;
 def: Joined<["--", "-"], "reproducer=">, Alias<reproducer>;
 
@@ -179,7 +179,7 @@ def gen_reproducer: F<"gen-reproducer">,
 
 def use_reproducer: Separate<["--", "-"], "use-reproducer">,
   MetaVarName<"<path>">,
-  HelpText<"Use the object files from the given reproducer path. Alias for --reproducer=Use.">,
+  HelpText<"Use the object files from the given reproducer path.">,
   Group<grp_general>;
 def: Joined<["--", "-"], "use-reproducer=">, Alias<use_reproducer>;
 
@@ -194,3 +194,14 @@ def remarks_output_format: Separate<["--", "-"], "remarks-output-format">,
   HelpText<"Specify the format to be used when serializing the linked remarks.">,
   Group<grp_general>;
 def: Joined<["--", "-"], "remarks-output-format=">, Alias<remarks_output_format>;
+
+def remarks_drop_without_debug: Flag<["--", "-"], "remarks-drop-without-debug">,
+  HelpText<"Drop remarks without valid debug locations. Without this flags, "
+           "all remarks are kept.">,
+  Group<grp_general>;
+
+def linker: Separate<["--", "-"], "linker">,
+  MetaVarName<"<DWARF linker type>">,
+  HelpText<"Specify the desired type of DWARF linker. Defaults to 'apple'">,
+  Group<grp_general>;
+def: Joined<["--", "-"], "linker=">, Alias<linker>;

@@ -162,7 +162,7 @@ namespace {
     struct BlockCacheEntry {
       SmallDenseMap<AssertingVH<Value>, ValueLatticeElement, 4> LatticeElements;
       SmallDenseSet<AssertingVH<Value>, 4> OverDefined;
-      // None indicates that the nonnull pointers for this basic block
+      // std::nullopt indicates that the nonnull pointers for this basic block
       // block have not been computed yet.
       std::optional<NonNullPointerSet> NonNullPointers;
     };
@@ -876,10 +876,14 @@ LazyValueInfoImpl::solveBlockValueSelect(SelectInst *SI, BasicBlock *BB) {
   // condition itself?  This shows up with idioms like e.g. select(a > 5, a, 5).
   // TODO: We could potentially refine an overdefined true value above.
   Value *Cond = SI->getCondition();
-  TrueVal = intersect(TrueVal,
-                      getValueFromCondition(SI->getTrueValue(), Cond, true));
-  FalseVal = intersect(FalseVal,
-                       getValueFromCondition(SI->getFalseValue(), Cond, false));
+  // If the value is undef, a different value may be chosen in
+  // the select condition.
+  if (isGuaranteedNotToBeUndefOrPoison(Cond, AC)) {
+    TrueVal = intersect(TrueVal,
+                        getValueFromCondition(SI->getTrueValue(), Cond, true));
+    FalseVal = intersect(
+        FalseVal, getValueFromCondition(SI->getFalseValue(), Cond, false));
+  }
 
   ValueLatticeElement Result = TrueVal;
   Result.mergeIn(FalseVal);
@@ -1667,6 +1671,10 @@ ConstantRange LazyValueInfo::getConstantRangeAtUse(const Use &U,
     std::optional<ValueLatticeElement> CondVal;
     auto *CurrI = cast<Instruction>(CurrU->getUser());
     if (auto *SI = dyn_cast<SelectInst>(CurrI)) {
+      // If the value is undef, a different value may be chosen in
+      // the select condition and at use.
+      if (!isGuaranteedNotToBeUndefOrPoison(SI->getCondition(), AC))
+        break;
       if (CurrU->getOperandNo() == 1)
         CondVal = getValueFromCondition(V, SI->getCondition(), true);
       else if (CurrU->getOperandNo() == 2)
@@ -1741,7 +1749,7 @@ getPredicateResult(unsigned Pred, Constant *C, const ValueLatticeElement &Val,
   Constant *Res = nullptr;
   if (Val.isConstant()) {
     Res = ConstantFoldCompareInstOperands(Pred, Val.getConstant(), C, DL, TLI);
-    if (ConstantInt *ResCI = dyn_cast<ConstantInt>(Res))
+    if (ConstantInt *ResCI = dyn_cast_or_null<ConstantInt>(Res))
       return ResCI->isZero() ? LazyValueInfo::False : LazyValueInfo::True;
     return LazyValueInfo::Unknown;
   }
@@ -1783,14 +1791,14 @@ getPredicateResult(unsigned Pred, Constant *C, const ValueLatticeElement &Val,
       Res = ConstantFoldCompareInstOperands(ICmpInst::ICMP_NE,
                                             Val.getNotConstant(), C, DL,
                                             TLI);
-      if (Res->isNullValue())
+      if (Res && Res->isNullValue())
         return LazyValueInfo::False;
     } else if (Pred == ICmpInst::ICMP_NE) {
       // !C1 != C -> true iff C1 == C.
       Res = ConstantFoldCompareInstOperands(ICmpInst::ICMP_NE,
                                             Val.getNotConstant(), C, DL,
                                             TLI);
-      if (Res->isNullValue())
+      if (Res && Res->isNullValue())
         return LazyValueInfo::True;
     }
     return LazyValueInfo::Unknown;
